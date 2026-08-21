@@ -1,4 +1,4 @@
-import { getAllIncludingDeleted, getMeta, markSyncError, saveRemoteRecord, setMeta } from '../database/indexedDb';
+import { deleteLocalRecord, getAllIncludingDeleted, getMeta, markSyncError, remapGestionId, saveRemoteRecord, setMeta } from '../database/indexedDb';
 import { supabase, supabaseConfigured } from './supabase';
 import { resolveLastWriteWins } from './syncConflict';
 
@@ -28,6 +28,43 @@ function cleanPayload(store, record) {
   return payload;
 }
 
+function normalizeKey(value) { return (value || '').trim().toLocaleLowerCase(); }
+function isUniqueConflict(error) { return error?.status === 409 || error?.code === '23505' || /duplicate|unique/i.test(error?.message || ''); }
+
+async function findRemoteByNaturalKey(store, record) {
+  if (store === 'dispositivos') {
+    const { data, error } = await supabase.from(store).select('*').is('deleted_at', null).ilike('serie', record.serie.trim());
+    if (error) throw new Error(`${store}/serie: ${error.message}`);
+    return (data || []).find(item => normalizeKey(item.serie) === normalizeKey(record.serie)) || null;
+  }
+  if (store === 'gestiones' || ['modelos', 'estados', 'fallas'].includes(store)) {
+    const { data, error } = await supabase.from(store).select('*').is('deleted_at', null).ilike('nombre', record.nombre.trim());
+    if (error) throw new Error(`${store}/nombre: ${error.message}`);
+    return (data || []).find(item => normalizeKey(item.nombre) === normalizeKey(record.nombre)) || null;
+  }
+  return null;
+}
+
+async function reconcileCanonicalRecord(store, local, remote) {
+  const canonical = fromRemote(store, remote);
+  if (store === 'gestiones' && local.id !== remote.id) await remapGestionId(local.id, remote.id);
+  await saveRemoteRecord(store, canonical);
+  if (local.id !== remote.id) await deleteLocalRecord(store, local.id);
+  return canonical;
+}
+
+async function reconcileNaturalConflict(store, local, remote) {
+  if (store !== 'dispositivos') return reconcileCanonicalRecord(store, local, remote);
+  const winner = resolveLastWriteWins(local, remote);
+  if (winner === 'remote' || winner === 'same') return reconcileCanonicalRecord(store, local, remote);
+  const { data, error } = await supabase.from(store).upsert(cleanPayload(store, { ...local, id: remote.id }), { onConflict: 'id' }).select().single();
+  if (error) throw new Error(`${store}/serie: ${error.message}`);
+  const canonical = fromRemote(store, data);
+  await saveRemoteRecord(store, canonical);
+  if (local.id !== remote.id) await deleteLocalRecord(store, local.id);
+  return canonical;
+}
+
 async function getRemoteById(store, id) {
   const { data, error } = await supabase.from(store).select('*').eq('id', id).maybeSingle();
   if (error) throw new Error(`${store}/${id}: ${error.message}`);
@@ -40,7 +77,14 @@ async function getRemoteById(store, id) {
  * remota más reciente con un cambio offline antiguo.
  */
 export async function upsertOne(store, record) {
-  const remote = await getRemoteById(store, record.id);
+  let remote = await getRemoteById(store, record.id);
+  if (!remote) {
+    const naturalMatch = await findRemoteByNaturalKey(store, record);
+    if (naturalMatch) {
+      const canonical = await reconcileNaturalConflict(store, record, naturalMatch);
+      return { outcome: 'natural-key-reconciled', record: canonical };
+    }
+  }
   const winner = resolveLastWriteWins(record, remote);
 
   if (winner === 'remote' || winner === 'same') {
@@ -48,7 +92,15 @@ export async function upsertOne(store, record) {
     return { outcome: winner === 'remote' ? 'remote-won' : 'same', record: remote };
   }
 
-  const { data, error } = await supabase.from(store).upsert(cleanPayload(store, record), { onConflict: 'id' }).select().single();
+  const payload = cleanPayload(store, record);
+  let { data, error } = await supabase.from(store).upsert(payload, { onConflict: 'id' }).select().single();
+  if (error && isUniqueConflict(error)) {
+    const naturalMatch = await findRemoteByNaturalKey(store, record);
+    if (naturalMatch) {
+      const canonical = await reconcileNaturalConflict(store, record, naturalMatch);
+      return { outcome: 'natural-key-reconciled', record: canonical };
+    }
+  }
   if (error) { await markSyncError(store, record.id); throw new Error(`${store}/${record.id}: ${error.message}`); }
   const stored = fromRemote(store, data);
   await saveRemoteRecord(store, stored);

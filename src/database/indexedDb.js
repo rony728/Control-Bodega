@@ -78,6 +78,23 @@ export async function saveRemoteRecord(store, record) {
   return request(db.transaction(store, 'readwrite').objectStore(store).put(value));
 }
 
+export async function deleteLocalRecord(store, id) {
+  const db = await openDb();
+  return request(db.transaction(store, 'readwrite').objectStore(store).delete(id));
+}
+
+export async function remapGestionId(fromId, toId) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('dispositivos', 'readwrite');
+    const objectStore = tx.objectStore('dispositivos');
+    const read = objectStore.getAll();
+    read.onsuccess = () => read.result.filter(record => record.gestionId === fromId).forEach(record => { record.gestionId = toId; record.sync_status = 'pending'; objectStore.put(record); });
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 export async function softDeleteRecord(store, id) {
   const db = await openDb();
   const objectStore = db.transaction(store, 'readwrite').objectStore(store);

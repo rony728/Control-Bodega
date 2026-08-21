@@ -51,6 +51,8 @@ IndexedDB se actualizó a la versión 2. Los registros antiguos se migran durant
 
 Cada alta, edición o eliminación escribe primero en IndexedDB y no se bloquea por falta de Internet. Al conectar, el motor sube primero gestiones y catálogos, después dispositivos; luego consulta cambios remotos desde `lastSuccessfulSync`. La cola evita sincronizaciones simultáneas. Realtime dispara una sincronización adicional, pero no es requisito para guardar.
 
+En el arranque con sesión y conexión, primero se hace PULL, después se crean únicamente catálogos faltantes y finalmente se hace PUSH. Si un registro local pendiente tiene el mismo nombre de catálogo, nombre de gestión o serie que uno remoto con otro UUID, se adopta el UUID remoto; las relaciones `gestionId` locales se remapean antes de retirar el UUID duplicado.
+
 En un conflicto, gana el registro con `updated_at` más reciente. Si PostgreSQL rechaza una serie duplicada, el registro local no se borra: queda con `sync_status = error` y el estado de sincronización muestra el error para corregirlo.
 
 La decisión LWW está aislada en `src/services/syncConflict.js` mediante `compareUpdatedAt()` y `resolveLastWriteWins()`, por lo que puede verificarse sin conexión ni credenciales.
