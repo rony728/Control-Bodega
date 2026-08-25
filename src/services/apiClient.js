@@ -24,7 +24,12 @@ async function request(path, options = {}) {
   try {
     const response = await fetch(`${API_URL}${path}`, { ...options, headers, signal: controller.signal });
     let body = null; try { body = await response.json(); } catch { body = null; }
-    if (response.status === 401) { clearSession(); throw new Error('La sesión expiró. Inicia sesión nuevamente cuando tengas Internet.'); }
+    if (response.status === 401) {
+      const apiMessage = body?.message || body?.error || 'Credenciales incorrectas';
+      if (path === '/api/auth/login') throw new Error(apiMessage);
+      clearSession();
+      throw new Error('La sesión expiró. Inicia sesión nuevamente cuando tengas Internet.');
+    }
     if (!response.ok || body?.ok === false) throw new Error(body?.message || body?.error || `Error HTTP ${response.status}`);
     return body;
   } catch (error) { if (error.name === 'AbortError') throw new Error('La solicitud tardó demasiado. Comprueba tu conexión.'); throw error; }

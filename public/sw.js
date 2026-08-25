@@ -1,7 +1,7 @@
 const BASE = '/Control-Bodega/';
 const API_ORIGIN = 'https://api-control-bodega.rtdev.uk';
 const CACHE = 'control-bodega-v3';
-self.addEventListener('install', event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll([BASE, `${BASE}index.html`, `${BASE}manifest.json`, `${BASE}icon.svg`]))));
+self.addEventListener('install', event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll([BASE, `${BASE}index.html`, `${BASE}manifest.json`, `${BASE}icon.svg`])).then(() => self.skipWaiting())));
 self.addEventListener('activate', event => event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(key => key !== CACHE).map(key => caches.delete(key)))).then(() => self.clients.claim())));
 self.addEventListener('fetch', event => {
   const request = event.request; const url = new URL(request.url);
