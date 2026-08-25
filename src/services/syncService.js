@@ -1,179 +1,67 @@
 import { deleteLocalRecord, getAllIncludingDeleted, getMeta, markSyncError, remapGestionId, saveRemoteRecord, setMeta } from '../database/indexedDb';
-import { supabase, supabaseConfigured } from './supabase';
+import { apiRequest, getSession } from './apiClient';
 import { resolveLastWriteWins } from './syncConflict';
 
-const TABLES = ['gestiones', 'modelos', 'estados', 'fallas', 'dispositivos'];
+export const TABLES = ['gestiones', 'modelos', 'estados', 'fallas', 'dispositivos'];
 let running = null;
 
-function toRemote(store, record) {
-  if (store === 'dispositivos') return { ...record, gestion_id: record.gestionId, fecha_registro: record.fechaRegistro, descripcion_falla: record.descripcionFalla };
-  if (store === 'gestiones') return { ...record, fecha_creacion: record.fechaCreacion };
-  return { ...record };
+export function toRemote(store, record) {
+  const remote = { ...record };
+  if (store === 'dispositivos') { remote.gestion_id = record.gestionId; remote.fecha_registro = record.fechaRegistro; remote.descripcion_falla = record.descripcionFalla; delete remote.gestionId; delete remote.fechaRegistro; delete remote.descripcionFalla; }
+  if (store === 'gestiones') { remote.fecha_creacion = record.fechaCreacion; delete remote.fechaCreacion; }
+  delete remote.sync_status; delete remote.server_updated_at;
+  return remote;
 }
-
-function fromRemote(store, record) {
-  if (store === 'dispositivos') return { ...record, gestionId: record.gestion_id, fechaRegistro: record.fecha_registro, descripcionFalla: record.descripcion_falla };
-  if (store === 'gestiones') return { ...record, fechaCreacion: record.fecha_creacion };
-  return record;
+export function fromRemote(store, record) {
+  const local = { ...record };
+  if (store === 'dispositivos') { local.gestionId = record.gestion_id; local.fechaRegistro = record.fecha_registro; local.descripcionFalla = record.descripcion_falla; delete local.gestion_id; delete local.fecha_registro; delete local.descripcion_falla; }
+  if (store === 'gestiones') { local.fechaCreacion = record.fecha_creacion; delete local.fecha_creacion; }
+  return local;
 }
-
-function cleanPayload(store, record) {
-  const payload = toRemote(store, record);
-  delete payload.sync_status;
-  delete payload.gestionId;
-  delete payload.fechaRegistro;
-  delete payload.descripcionFalla;
-  delete payload.fechaCreacion;
-  delete payload.server_updated_at;
-  return payload;
+async function saveWinner(store, oldRecord, remoteRecord) {
+  const winner = fromRemote(store, remoteRecord);
+  if (oldRecord && oldRecord.id !== winner.id && store === 'gestiones') await remapGestionId(oldRecord.id, winner.id);
+  await saveRemoteRecord(store, winner);
+  if (oldRecord && oldRecord.id !== winner.id) await deleteLocalRecord(store, oldRecord.id);
+  return winner;
 }
-
-function normalizeKey(value) { return (value || '').trim().toLocaleLowerCase(); }
-function isUniqueConflict(error) { return error?.status === 409 || error?.code === '23505' || /duplicate|unique/i.test(error?.message || ''); }
-
-async function findRemoteByNaturalKey(store, record) {
-  if (store === 'dispositivos') {
-    const { data, error } = await supabase.from(store).select('*').is('deleted_at', null).ilike('serie', record.serie.trim());
-    if (error) throw new Error(`${store}/serie: ${error.message}`);
-    return (data || []).find(item => normalizeKey(item.serie) === normalizeKey(record.serie)) || null;
+export async function upsertOne(store, local) {
+  const response = await apiRequest(`/api/${store}/sync`, { method: 'POST', body: JSON.stringify({ record: toRemote(store, local) }) });
+  if (!response.record) throw new Error(`${store}: la API no devolvió el registro ganador.`);
+  return { action: response.action, reconciled: response.reconciled, record: await saveWinner(store, local, response.record) };
+}
+async function pushPendingChanges() {
+  if (!getSession()) return { skipped: true, pending: 0, errors: [] };
+  const errors = []; let pending = 0;
+  for (const store of TABLES) {
+    const records = (await getAllIncludingDeleted(store)).filter(record => record.sync_status === 'pending' || record.sync_status === 'error'); pending += records.length;
+    for (const record of records) try { await upsertOne(store, record); } catch (error) { await markSyncError(store, record.id); errors.push(`${store}/${record.id}: ${error.message}`); }
   }
-  if (store === 'gestiones' || ['modelos', 'estados', 'fallas'].includes(store)) {
-    const { data, error } = await supabase.from(store).select('*').is('deleted_at', null).ilike('nombre', record.nombre.trim());
-    if (error) throw new Error(`${store}/nombre: ${error.message}`);
-    return (data || []).find(item => normalizeKey(item.nombre) === normalizeKey(record.nombre)) || null;
-  }
-  return null;
+  return { skipped: false, pending, errors };
 }
-
-async function reconcileCanonicalRecord(store, local, remote) {
-  const canonical = fromRemote(store, remote);
-  if (store === 'gestiones' && local.id !== remote.id) await remapGestionId(local.id, remote.id);
-  await saveRemoteRecord(store, canonical);
-  if (local.id !== remote.id) await deleteLocalRecord(store, local.id);
-  return canonical;
-}
-
-async function reconcileNaturalConflict(store, local, remote) {
-  if (store !== 'dispositivos') return reconcileCanonicalRecord(store, local, remote);
-  const winner = resolveLastWriteWins(local, remote);
-  if (winner === 'remote' || winner === 'same') return reconcileCanonicalRecord(store, local, remote);
-  const { data, error } = await supabase.from(store).upsert(cleanPayload(store, { ...local, id: remote.id }), { onConflict: 'id' }).select().single();
-  if (error) throw new Error(`${store}/serie: ${error.message}`);
-  const canonical = fromRemote(store, data);
-  await saveRemoteRecord(store, canonical);
-  if (local.id !== remote.id) await deleteLocalRecord(store, local.id);
-  return canonical;
-}
-
-async function getRemoteById(store, id) {
-  const { data, error } = await supabase.from(store).select('*').eq('id', id).maybeSingle();
-  if (error) throw new Error(`${store}/${id}: ${error.message}`);
-  return data;
-}
-
-/**
- * Sube únicamente si la versión local realmente gana. En caso contrario,
- * conserva la versión remota recibida y nunca sobrescribe una modificación
- * remota más reciente con un cambio offline antiguo.
- */
-export async function upsertOne(store, record) {
-  let remote = await getRemoteById(store, record.id);
-  if (!remote) {
-    const naturalMatch = await findRemoteByNaturalKey(store, record);
-    if (naturalMatch) {
-      const canonical = await reconcileNaturalConflict(store, record, naturalMatch);
-      return { outcome: 'natural-key-reconciled', record: canonical };
-    }
-  }
-  const winner = resolveLastWriteWins(record, remote);
-
-  if (winner === 'remote' || winner === 'same') {
-    await saveRemoteRecord(store, fromRemote(store, remote));
-    return { outcome: winner === 'remote' ? 'remote-won' : 'same', record: remote };
-  }
-
-  const payload = cleanPayload(store, record);
-  let { data, error } = await supabase.from(store).upsert(payload, { onConflict: 'id' }).select().single();
-  if (error && isUniqueConflict(error)) {
-    const naturalMatch = await findRemoteByNaturalKey(store, record);
-    if (naturalMatch) {
-      const canonical = await reconcileNaturalConflict(store, record, naturalMatch);
-      return { outcome: 'natural-key-reconciled', record: canonical };
-    }
-  }
-  if (error) { await markSyncError(store, record.id); throw new Error(`${store}/${record.id}: ${error.message}`); }
-  const stored = fromRemote(store, data);
-  await saveRemoteRecord(store, stored);
-  return { outcome: remote ? 'local-won' : 'created', record: data };
-}
-
 export async function syncPendingChanges() {
-  if (!supabaseConfigured || !supabase) return { skipped: true, pending: 0, errors: [] };
   if (running) return running;
-  running = (async () => {
-    const errors = []; let pending = 0;
-    for (const store of TABLES) {
-      const records = (await getAllIncludingDeleted(store)).filter(record => record.sync_status === 'pending' || record.sync_status === 'error');
-      pending += records.length;
-      for (const record of records) try { await upsertOne(store, record); } catch (error) { errors.push(error.message); }
-    }
-    return { skipped: false, pending, errors };
-  })().finally(() => { running = null; });
+  running = pushPendingChanges().finally(() => { running = null; });
   return running;
 }
-
 export async function pullRemoteChanges() {
-  if (!supabaseConfigured || !supabase) return { skipped: true, count: 0, errors: [] };
-  const cursorType = (await getMeta('lastSuccessfulSyncKind'))?.value;
-  // Cursors creados por versiones anteriores usaban el reloj del cliente.
-  // Se ignoran una vez para hacer una recuperación completa segura.
-  const last = cursorType === 'server_updated_at' ? ((await getMeta('lastSuccessfulSync'))?.value || '1970-01-01T00:00:00.000Z') : '1970-01-01T00:00:00.000Z';
-  let count = 0; let maxServerUpdatedAt = last; const errors = [];
+  if (!getSession()) return { skipped: true, count: 0, errors: [] };
+  const errors = []; let count = 0;
   for (const store of TABLES) {
-    // Leer cada tabla local una sola vez. Esto también incluye eliminaciones lógicas.
-    const localMap = new Map((await getAllIncludingDeleted(store)).map(record => [record.id, record]));
-    const { data, error } = await supabase.from(store).select('*').gt('server_updated_at', last).order('server_updated_at', { ascending: true });
-    if (error) { errors.push(`${store}: ${error.message}`); continue; }
-    for (const remoteRow of data || []) {
-      if (remoteRow.server_updated_at && new Date(remoteRow.server_updated_at) > new Date(maxServerUpdatedAt)) maxServerUpdatedAt = remoteRow.server_updated_at;
-      const remote = fromRemote(store, remoteRow); const local = localMap.get(remote.id); const winner = resolveLastWriteWins(local, remote);
-      if (!local || winner === 'remote' || winner === 'same') { await saveRemoteRecord(store, remote); localMap.set(remote.id, remote); count += 1; }
-      // Si local gana, permanece pending/error para que PUSH lo compare de nuevo.
-    }
+    const metaKey = `lastSuccessfulSync:${store}`; const since = (await getMeta(metaKey))?.value;
+    try {
+      const response = await apiRequest(`/api/${store}${since ? `?since=${encodeURIComponent(since)}` : ''}`);
+      const localMap = new Map((await getAllIncludingDeleted(store)).map(record => [record.id, record]));
+      for (const row of response.records || []) { const remote = fromRemote(store, row); const local = localMap.get(remote.id); const winner = resolveLastWriteWins(local, remote); if (!local || winner === 'remote' || winner === 'same') { await saveRemoteRecord(store, remote); localMap.set(remote.id, remote); count += 1; } }
+      await setMeta(metaKey, response.cursor);
+    } catch (error) { errors.push(`${store}: ${error.message}`); }
   }
-  // El cursor avanza solo con el máximo server_updated_at realmente recibido.
-  // Si no hubo filas, conserva el cursor anterior. Nunca usa el reloj del cliente.
-  if (!errors.length) {
-    await setMeta('lastSuccessfulSyncKind', 'server_updated_at');
-    if (new Date(maxServerUpdatedAt) > new Date(last)) await setMeta('lastSuccessfulSync', maxServerUpdatedAt);
-  }
-  return { skipped: false, count, errors, lastSuccessfulSync: maxServerUpdatedAt };
+  return { skipped: false, count, errors };
 }
-
 export async function fullSync() {
-  if (!supabaseConfigured || !supabase) return { skipped: true, errors: [] };
-  const push = await syncPendingChanges(); const pull = await pullRemoteChanges();
-  return { ...pull, errors: [...(push.errors || []), ...(pull.errors || [])] };
+  if (!getSession()) return { skipped: true, errors: [] };
+  if (running) return running;
+  running = (async () => { const push = await pushPendingChanges(); const pull = await pullRemoteChanges(); return { ...pull, errors: [...(push.errors || []), ...(pull.errors || [])] }; })().finally(() => { running = null; });
+  return running;
 }
-
-export async function applyRealtimeChange(payload) {
-  if (!payload || !TABLES.includes(payload.table)) return { applied: false, reason: 'unknown-table' };
-  const remoteRow = payload.eventType === 'DELETE' ? payload.old : payload.new;
-  if (!remoteRow) return { applied: false, reason: 'empty-payload' };
-  const remote = fromRemote(payload.table, remoteRow);
-  const local = (await getAllIncludingDeleted(payload.table)).find(record => record.id === remote.id);
-  const winner = resolveLastWriteWins(local, remote);
-  if (!local || winner === 'remote' || winner === 'same') {
-    await saveRemoteRecord(payload.table, remote);
-    return { applied: true, winner };
-  }
-  return { applied: false, winner };
-}
-
-export function subscribeToRealtime(onChange) {
-  if (!supabaseConfigured || !supabase) return () => {};
-  const channel = supabase.channel('control-bodega-sync').on('postgres_changes', { event: '*', schema: 'public' }, payload => { applyRealtimeChange(payload).finally(() => onChange(payload)); }).subscribe();
-  return () => { supabase.removeChannel(channel); };
-}
-
-export { TABLES };
+export function subscribeToRealtime() { return () => {}; }
